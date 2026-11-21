@@ -177,6 +177,8 @@ def _register_as_source(storage: str, fmt: str, schema: list[str]) -> int:
 
 
 def _create_semantic_model_for_lake(source_id: int, storage: str, schema: list[str]) -> None:
+    from app.services import field_index
+
     rows = store.rows("semantic_model")
     model_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
     model = {
@@ -194,6 +196,27 @@ def _create_semantic_model_for_lake(source_id: int, storage: str, schema: list[s
         "abnormal": False,
     }
     rows.append(model)
+
+    # 同步登记字段身份映射，湖仓自动发现的字段也能参与改写规则反查。
+    mappings = store.rows("model_field_mapping")
+    for alias in schema:
+        mappings.append({
+            "id": max((int(row.get("id", 0)) for row in mappings), default=0) + 1,
+            "status": "可用",
+            "pending": False,
+            "abnormal": False,
+            "model_id": model_id,
+            "model_no": model["模型编号"],
+            "model_version": "v1.0-lake",
+            "source_id": source_id,
+            "source_no": f"SOUR-L{source_id:04d}",
+            "字段别名": alias,
+            "列名": alias,
+            "is_current": True,
+            "valid_from": time.strftime("%Y-%m-%d"),
+            "valid_to": "",
+        })
+    field_index.rebuild_query_index(f"湖仓自动发现语义模型 {model['模型编号']}")
 
 
 def _audit_lake_scan(path_id: int, storage: str, file_count: int) -> None:

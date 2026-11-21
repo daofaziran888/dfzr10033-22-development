@@ -46,6 +46,35 @@ npm run dev
 前端默认监听 `http://127.0.0.1:5173/`，dev server 不会自动打开浏览器，
 需要自己访问。`/api` 由 vite 代理到后端 `http://127.0.0.1:8000`。
 
+## 语义模型投产与改写规则字段影响
+
+除了工作台里的通用增删改查，后端还提供「改写规则字段影响查询」：
+
+- 查询索引由**活跃改写规则** + **语义模型字段映射** + **规则字段样本** 组成，
+  支持按模型、模型版本、来源、`as_of` 时间点和确切字段身份反查。
+- 索引重建先在锁外准备完整快照，再在锁内原子替换；同一份快照的并发重建
+  只有一个调用被确认为「完整索引」，其余调用复用同一份索引。
+- 命中关系区分 `confirmed`（可确认的字段身份）与 `possible`（可能关联）。
+  只有 confirmed 会作为回归校验输入；possible 只提示人工核对，不会停用规则。
+- 字段映射保留版本与有效期，历史改名仍能按当时的映射追查。
+- 只写裸列名的旧规则按来源分别用样本验证：只有样本证明会被改写的一侧才应用规则，
+  另一侧保持原值，其生产规则照常运行。
+- 语义模型投产时：字段影响查询 → 可确认命中作为回归输入 → 校验结果同步字段变更清单；
+  缺少另一侧样本时，更名的可用时间会延后。
+
+相关接口：
+
+```text
+GET  /api/tools/field-impact/query            字段改写影响反查
+GET  /api/tools/field-impact/index            索引状态（complete / confirmed_builds）
+POST /api/tools/field-impact/index/rebuild    重建索引（并发只确认一份）
+POST /api/query_rewrite/{id}/verify-samples   用两侧样本验证旧规则
+POST /api/semantic_model/{id}/promote         校验并投产，输出回归与变更清单同步
+GET  /api/semantic_model/{id}/promotion-checklist  投产前核对
+POST /api/semantic_model/{id}/rename-field    投产一次字段更名
+GET  /api/tools/field-changes/list            字段变更清单
+```
+
 ## 业务模块
 
 | 模块 | 目录 | 业务对象 | 主要字段 |

@@ -8,6 +8,15 @@ from typing import Any
 
 from app.seed import SEED_ROWS
 
+# 这些表是跨模块能力的内部索引/映射，不属于工作台里的业务模块，
+# 因此不参与模块数量、运营概览和动态资源路由的统计。
+AUXILIARY_TABLES = frozenset({
+    "model_field_mapping",
+    "field_change_list",
+    "rewrite_rule_sample",
+    "rewrite_rule_validation",
+})
+
 
 class Store:
     def __init__(self) -> None:
@@ -16,7 +25,7 @@ class Store:
         }
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(name for name in self._tables if name not in AUXILIARY_TABLES)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])

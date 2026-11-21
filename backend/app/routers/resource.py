@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
+from app.services import field_index
 from app.store import store
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
@@ -158,9 +159,11 @@ def pipeline_cube_build_cache(
 def pipeline_rewrite_estimate_execute(
     query: str = Query(default="SELECT * FROM source_registry"),
     model_ids: str = Query(default=""),
+    source_ids: str = Query(default=""),
 ) -> dict[str, Any]:
     mids = [int(m) for m in model_ids.split(",") if m.strip()] if model_ids else None
-    rr = rewrite_svc.rewrite_query(query, mids)
+    sids = [int(s) for s in source_ids.split(",") if s.strip()] if source_ids else None
+    rr = rewrite_svc.rewrite_query(query, mids, sids)
     cr = federation_svc.estimate_query_cost(["source_registry"], "SELECT")
     return {"ok": True, "pipeline": "rewrite_estimate_execute", "rewrite": rr, "cost_estimate": cr,
             "execution_summary": {"original": query, "rewritten": rr["rewritten"],
@@ -215,9 +218,81 @@ def pipeline_lake_scan_register(path_id: int = Query(...)) -> dict[str, Any]:
             "cost": lake_svc.estimate_partition_scan_cost(path_id, ("2026-11-01", "2026-11-17"))}
 
 
-@router.post("/pipelines/cost-aggregate-alert")
-def pipeline_cost_aggregate_alert() -> dict[str, Any]:
-    return {"ok": True, "pipeline": "cost_aggregate_alert",
-            "cost_aggregation": cost_svc.aggregate_module_costs(),
-            "quota_check": cost_svc.check_monthly_quota(),
-            "cache_report": result_cache_svc.cache_hit_rate_report()}
+# -- 改写规则字段影响查询 --
+
+@router.get("/tools/field-impact/query")
+def query_field_impact(
+    model_id: int | None = Query(default=None),
+    model_no: str | None = Query(default=None),
+    source_id: int | None = Query(default=None),
+    field: str | None = Query(default=None),
+    model_version: str | None = Query(default=None),
+    as_of: str | None = Query(default=None),
+    include_possible: bool = Query(default=True),
+    include_history: bool = Query(default=True),
+) -> dict[str, Any]:
+    """按模型版本、来源和确切字段身份反查活跃改写规则。"""
+    return field_index.query_field_impact(
+        model_id=model_id, model_no=model_no, source_id=source_id, field=field,
+        model_version=model_version, as_of=as_of,
+        include_possible=include_possible, include_history=include_history)
+
+
+@router.get("/tools/field-impact/index")
+def field_impact_index_status() -> dict[str, Any]:
+    field_index.ensure_index()
+    return field_index.current_index_status()
+
+
+@router.post("/tools/field-impact/index/rebuild")
+def rebuild_field_impact_index(reason: str = Query(default="")) -> dict[str, Any]:
+    """重建改写规则字段影响索引；并发重建只确认一份完整索引。"""
+    return field_index.rebuild_query_index(reason)
+
+
+@router.post("/query_rewrite/{rule_id}/verify-samples")
+def verify_rewrite_rule_samples(rule_id: int) -> dict[str, Any]:
+    """用同名字段在两边来源各自的样本，验证旧规则实际只改写哪一侧。"""
+    return rewrite_svc.verify_rule_samples(rule_id)
+
+
+@router.post("/semantic_model/{model_id}/promote")
+def promote_semantic_model(
+    model_id: int, rebuild_index: bool = Query(default=True),
+) -> dict[str, Any]:
+    """校验并投产语义模型：字段影响 → 回归校验输入 → 同步字段变更清单。"""
+    return semantic_svc.validate_and_promote(model_id, rebuild_index=rebuild_index)
+
+
+@router.get("/semantic_model/{model_id}/promotion-checklist")
+def semantic_model_promotion_checklist(model_id: int) -> dict[str, Any]:
+    """投产更名前的核对：已验证规则、待定位的列和实际可用字段。"""
+    return semantic_svc.build_promotion_checklist(model_id)
+
+
+@router.post("/semantic_model/{model_id}/rename-field")
+def rename_semantic_model_field(
+    model_id: int,
+    field_alias: str = Query(...),
+    target_alias: str = Query(...),
+    source_id: int | None = Query(default=None),
+    new_version: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """投产一次字段更名：核对可确认规则后才关闭旧映射并登记新版本。"""
+    return semantic_svc.rename_field(
+        model_id, field_alias=field_alias, target_alias=target_alias,
+        source_id=source_id, new_version=new_version)
+
+
+@router.get("/tools/field-changes/list")
+def list_field_change_list(
+    model_id: int | None = Query(default=None),
+    source_id: int | None = Query(default=None),
+) -> dict[str, Any]:
+    """字段变更清单：由语义模型投产回归结果同步而来。"""
+    items = list(store.rows("field_change_list"))
+    if model_id is not None:
+        items = [row for row in items if int(row.get("model_id", 0)) == model_id]
+    if source_id is not None:
+        items = [row for row in items if int(row.get("source_id", 0)) == source_id]
+    return {"ok": True, "items": items, "total": len(items)}

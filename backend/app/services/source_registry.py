@@ -95,6 +95,8 @@ def _discover_schema(source_type: str) -> list[str]:
 
 
 def _write_semantic_model(source_id: int, source_no: str, schema: list[str]) -> None:
+    from app.services import field_index
+
     rows = store.rows("semantic_model")
     model_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
     model = {
@@ -112,6 +114,27 @@ def _write_semantic_model(source_id: int, source_no: str, schema: list[str]) -> 
         "abnormal": False,
     }
     rows.append(model)
+
+    # 同步登记字段身份映射与模型版本，历史改名仍能按当时映射反查。
+    mappings = store.rows("model_field_mapping")
+    for index, alias in enumerate(schema):
+        mappings.append({
+            "id": max((int(row.get("id", 0)) for row in mappings), default=0) + 1,
+            "status": "可用",
+            "pending": False,
+            "abnormal": False,
+            "model_id": model_id,
+            "model_no": model["模型编号"],
+            "model_version": "v1.0-auto",
+            "source_id": source_id,
+            "source_no": source_no,
+            "字段别名": alias,
+            "列名": alias,
+            "is_current": True,
+            "valid_from": time.strftime("%Y-%m-%d"),
+            "valid_to": "",
+        })
+    field_index.rebuild_query_index(f"自动发现语义模型 {model['模型编号']}")
 
 
 def _write_audit(source_id: int, source_no: str, action: str) -> None:

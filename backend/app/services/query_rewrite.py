@@ -6,6 +6,7 @@ import time
 import uuid
 from typing import Any
 
+from app.services import field_index
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -20,41 +21,134 @@ class QueryRewriteService(BaseModuleService):
     ACTION_RULES = {"启效规则": "已生效", "提交验证": "待验证", "废弃规则": "已废弃"}
     NEGATIVE_ACTIONS = ["废弃规则"]
 
+    def verify_rule_samples(self, rule_id: int) -> dict[str, Any]:
+        """用规则在各来源上的字段样本逐侧验证旧规则的真实改写范围。
+
+        只写了裸列名的旧规则可能同时命中多份来源的同名字段；这里按来源分别
+        应用各自的样本，确认它到底改写了哪一侧，以及另一侧是否被误改。
+        """
+        rule = store.find(self.MODULE, rule_id)
+        if rule is None:
+            return {"ok": False, "message": f"改写规则 {rule_id} 不存在"}
+
+        result = field_index.evaluate_rule_samples(rule_id)
+        changed_sources = result["changed_sources"]
+        unchanged_sources = result["unchanged_sources"]
+        missing_sources = result["missing_sources"]
+        fully_verified = result["fully_verified"]
+
+        record = {
+            "id": max((int(row.get("id", 0)) for row in store.rows("rewrite_rule_validation")), default=0) + 1,
+            "rule_id": rule_id,
+            "rule_no": rule.get("规则编号", ""),
+            "来源数": str(len(result["effects"])),
+            "改写来源": ",".join(str(source) for source in changed_sources),
+            "未改写来源": ",".join(str(source) for source in unchanged_sources),
+            "验证结论": "完整" if fully_verified else "待补样本",
+            "missing_sources": missing_sources,
+            "status": "有效" if fully_verified else "待验证",
+            "pending": not fully_verified,
+            "abnormal": False,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        store.rows("rewrite_rule_validation").append(record)
+
+        return {
+            "ok": True,
+            "rule_id": rule_id,
+            "rule_no": rule.get("规则编号", ""),
+            "rule_is_legacy": field_index.rule_scope_model_id(rule) is None,
+            "effects": result["effects"],
+            "changed_sources": changed_sources,
+            "unchanged_sources": unchanged_sources,
+            "missing_sources": missing_sources,
+            "fully_verified": fully_verified,
+            "message": (
+                "两侧样本都已验证，旧规则只改写已确认的那一侧"
+                if fully_verified
+                else "仍有来源缺少字段样本，无法确认该来源不受规则影响"
+            ),
+        }
+
     def rewrite_query(
-        self, raw_query: str, model_ids: list[int] | None = None
+        self, raw_query: str, model_ids: list[int] | None = None,
+        source_ids: list[int] | None = None,
     ) -> dict[str, Any]:
-        """应用已生效规则改写查询：读取 semantic_model 和 query_audit，写入 result_cache 和 cost_govern。"""
+        """应用已生效规则改写查询：读取 semantic_model 和 query_audit，写入 result_cache 和 cost_govern。
+
+        只写了裸列名的旧规则不会无差别改写所有同名字段：如果规则带有按来源的
+        字段样本，只有样本证明确实被改写的来源会应用该规则；另一侧来源的
+        值保持不变，其生产规则照常运行。
+        """
         rules = store.rows(self.MODULE)
         active_rules = [r for r in rules if r.get("status") == "已生效"]
+        scope_sources = set(int(source) for source in (source_ids or []))
 
         if not active_rules:
-            return {"ok": True, "rewritten": raw_query, "rules_applied": 0, "savings": 0}
+            return {"ok": True, "rewritten": raw_query, "rules_applied": 0, "savings": 0,
+                    "skipped_rules": [], "target_source_ids": sorted(scope_sources)}
 
         rewritten = raw_query
         rules_applied = 0
+        applied_rules: list[dict[str, Any]] = []
+        skipped_rules: list[dict[str, Any]] = []
 
         for rule in active_rules:
             pattern = rule.get("原始模式", "")
             replacement = rule.get("替换模式", "")
             condition = rule.get("改写条件", "")
 
-            if pattern and pattern in rewritten:
-                # 检查改写条件（从语义模型匹配）
-                if model_ids:
-                    matched = _match_models(condition, model_ids)
-                    if not matched:
-                        continue
+            if not pattern or pattern not in rewritten:
+                continue
+            # 检查改写条件（从语义模型匹配）
+            if model_ids and not _match_models(condition, model_ids):
+                continue
 
-                rewritten = rewritten.replace(pattern, replacement)
-                rules_applied += 1
+            scope = field_index.rule_sample_scope(int(rule.get("id", 0)))
+            affected = set(scope["affected_sources"])
+            unaffected = set(scope["unaffected_sources"])
+            has_samples = bool(affected or unaffected)
 
-                # 更新规则命中计数
-                try:
-                    hit_count = int(rule.get("命中次数", "0"))
-                except (ValueError, TypeError):
-                    hit_count = 0
-                rule["命中次数"] = str(hit_count + 1)
-                rule["最后命中"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            # 规则只要有来源级样本，就只能改写样本证明确实受影响的那一侧；
+            # 目标来源缺少样本或样本显示未被改写时保持原值，不冒险改写。
+            if scope_sources and has_samples:
+                targets = scope_sources & affected
+                if not targets:
+                    skipped_rules.append({
+                        "rule_id": int(rule.get("id", 0)),
+                        "rule_no": rule.get("规则编号", ""),
+                        "reason": (
+                            "目标来源未被样本确认会被改写，保持原值"
+                            if scope_sources & unaffected
+                            else "目标来源缺少字段样本，暂不改写"
+                        ),
+                        "target_sources": sorted(scope_sources),
+                        "unsampled_sources": sorted(scope["unsampled_sources"]),
+                    })
+                    continue
+            elif scope_sources:
+                targets = set(scope_sources)  # 没有样本的规则保持原有全局语义
+            else:
+                targets = set()
+
+            rewritten = rewritten.replace(pattern, replacement)
+            rules_applied += 1
+
+            # 更新规则命中计数
+            try:
+                hit_count = int(rule.get("命中次数", "0"))
+            except (ValueError, TypeError):
+                hit_count = 0
+            rule["命中次数"] = str(hit_count + 1)
+            rule["最后命中"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            applied_rules.append({
+                "rule_id": int(rule.get("id", 0)),
+                "rule_no": rule.get("规则编号", ""),
+                "applied_source_ids": sorted(targets) if targets else sorted(scope_sources),
+                "unchanged_source_ids": sorted(
+                    (scope_sources - targets) if scope_sources and affected else unaffected
+                ),
+            })
 
         # 估算节省量并写入成本治理
         savings = _estimate_savings(raw_query, rewritten, rules_applied)
@@ -69,6 +163,8 @@ class QueryRewriteService(BaseModuleService):
             "original": raw_query,
             "rewritten": rewritten,
             "rules_applied": rules_applied,
+            "applied_rules": applied_rules,
+            "skipped_rules": skipped_rules,
             "estimated_savings_rows": savings,
         }
 
